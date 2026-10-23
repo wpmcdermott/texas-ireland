@@ -1,0 +1,890 @@
+---
+title: "A Comparative Analysis of the Housing Crises in Ireland and Texas"
+author: "Will McDermott"
+date: "2026-05-04"
+output: 
+  html_document:
+    theme: flatly
+    toc: yes
+    toc_float:
+      collapsed: true
+    toc_depth: 2
+---
+
+<!-- TO VISIT THE PUBLISHED PAGE: https://rpubs.com/will_mcd23/1429400 -->
+
+```{r setup, echo = FALSE, message = FALSE, warning = FALSE, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+setwd("~/Downloads/willrstudio")
+knitr::opts_knit$set(root.dir = "~/Downloads/willrstudio")
+
+library(tidyverse)
+library(tidycensus)
+library(ggplot2)
+library(ggeffects)
+library(ggrepel)
+library(tidyr)
+library(zoo)
+library(readxl)
+library(lubridate)
+library(scales)
+library(sp)
+#library(rgdal)
+library(cowplot)
+library(ggpubr)
+library(maps)
+library(sf)
+library(viridis)
+library(stringr)
+options(tigris_use_cache = TRUE)
+options(pbapply.pb = NULL)
+
+# 1.) PULLING THE DATASETS
+
+#Every property sale in Ireland since 2010
+irelandpropertysales = read.csv("PPR-ALL.csv", fileEncoding = "latin1")
+colnames(irelandpropertysales) = gsub("[^\x20-\x7E]", "", colnames(irelandpropertysales))
+
+# RTB Rent Index
+irelandRTBrentindex = read.csv("RIQ02.20260502T110552.csv", fileEncoding = "latin1")
+colnames(irelandRTBrentindex) = gsub("[^\x20-\x7E]", "", colnames(irelandRTBrentindex))
+      
+# Ireland's CSO Office 
+
+      # Median household income by county 2004 - 2019
+      irelandcountyincome = read.csv("CIA02.20260503T160510.csv")
+
+      # Population growth by county
+      irelandpopulationgrowthbycounty = read.csv("FY001.20260502T120555.csv")
+      
+      # New dwelling completions
+      irelandnewhousingcompletions = read.csv("NDA01.20260502T120528.csv")
+      
+#Ireland Shapefiles
+      
+      # County level map
+      ie.map = st_read("Counties___OSi_National_Statutory_Boundaries_6992995305049023017.gpkg")
+      
+# Texas Housing Activity
+      
+      # Median home prices by county
+      texashousingactivity = read.csv("Housing Activity.csv")
+      
+# Rent data in Texas from 2010-2023
+      
+      # Rent data
+      years <- c(2010:2019, 2021:2023)  # 2020 ACS was not released due to COVID
+      
+      texasrentdata <- map_dfr(years, function(yr) {
+        tryCatch({
+          get_acs(
+            geography = "county",
+            variables = c(median_rent = "B25058_001"),
+            state = "TX",
+            year = yr
+          ) %>%
+            mutate(year = yr)
+        }, error = function(e) {
+          message("Failed for year: ", yr, " — ", e$message)
+          return(NULL)  # skips failed years instead of stopping
+        })
+      })
+      
+      tx_acs_all = map_dfr(years, function(yr) {
+        tryCatch({
+          get_acs(
+            geography = "county",
+            variables = c(
+              median_income    = "B19013_001",  # median household income
+              median_rent      = "B25058_001",  # median gross rent
+              total_pop        = "B01003_001",  # total population
+              cost_burdened    = "B25070_007",  # households spending 30-34% on housing
+              cost_burdened_35 = "B25070_008",  # households spending 35-39%
+              cost_burdened_40 = "B25070_009",  # households spending 40-49%
+              cost_burdened_50 = "B25070_010",  # households spending 50%+
+              total_renters    = "B25070_001"   # total renter households (denominator)
+            ),
+            state = "TX",
+            year = yr
+          ) %>%
+            mutate(year = yr)
+        }, error = function(e) {
+          message("Failed for year: ", yr, " — ", e$message)
+          return(NULL)
+        })
+      })
+
+      texas_burden <- tx_acs_all %>%
+        select(GEOID, NAME, variable, estimate, year) %>%
+        pivot_wider(names_from = variable, values_from = estimate) %>%
+        mutate(
+          # total cost burdened = spending 30%+ on housing
+          total_burdened = cost_burdened + cost_burdened_35 + 
+            cost_burdened_40 + cost_burdened_50,
+          # % of renter households that are cost burdened
+          pct_burdened = (total_burdened / total_renters) * 100
+        )
+      
+# Visual 4 issues -- variables not defined
+      
+      #ireland completions 
+      ireland_completions = irelandnewhousingcompletions %>%
+      filter(Eircode.Output == "All", Year >=2012, Year <=2023) %>%
+      select (year = Year, completions = VALUE) %>%
+      mutate(completions = as.numeric(completions))
+      
+      #ireland population annual
+      ireland_pop_census = irelandpopulationgrowthbycounty %>%
+      filter(County == "State", Sex == "Both sexes",
+             CensusYear %in% c(2011, 2016, 2022)) %>%
+      select(year = CensusYear, population = VALUE) %>%
+      mutate(population = as.numeric(population))
+      
+      ireland_pop_annual = data.frame(year = 2011:2023) %>%
+      left_join(ireland_pop_census, by = "year") %>%
+      mutate(population = zoo::na.approx(population, na.rm = FALSE)) %>%
+      filter(year >= 2012)
+      
+      # --- TEXAS COMPLETIONS PROXY ---
+tx_completions_annual <- data.frame(year = 2010:2023) %>%
+  left_join(
+    tx_acs_all %>%
+      filter(variable == "total_pop") %>%
+      group_by(year) %>%
+      summarise(population = sum(estimate, na.rm = TRUE)),
+    by = "year"
+  ) %>%
+  mutate(population = zoo::na.approx(population, na.rm = FALSE))
+
+tx_units <- tx_acs_all %>%
+  filter(variable == "total_renters") %>%
+  group_by(year) %>%
+  summarise(total_units = sum(estimate, na.rm = TRUE)) %>%
+  arrange(year)
+
+```
+
+```{css, echo=FALSE}
+@import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;600;700&family=Inter:wght@300;400;500;600&display=swap');
+
+body {
+  font-family: 'Inter', sans-serif;
+  font-size: 15px;
+  color: #1a1a1a;
+  line-height: 1.75;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 0 20px;
+}
+
+h1, h2, h3 {
+  font-family: 'Source Serif 4', serif;
+  color: #1a1a1a;
+}
+
+h1.title {
+  font-size: 2.4em;
+  font-weight: 700;
+  text-align: center;
+  margin-top: 40px;
+  margin-bottom: 5px;
+}
+
+h4.author {
+  text-align: center;
+  font-weight: 400;
+  font-size: 1em;
+  color: #555;
+}
+
+h4.date {
+  text-align: center;
+  font-weight: 300;
+  font-size: 0.9em;
+  color: #888;
+  margin-bottom: 30px;
+}
+
+h2 {
+  font-size: 1.5em;
+  font-weight: 600;
+  border-bottom: 2px solid #009A44;
+  padding-bottom: 6px;
+  margin-top: 50px;
+  margin-bottom: 20px;
+}
+
+.executive-summary {
+  background-color: #f8f8f8;
+  border-left: 4px solid #009A44;
+  padding: 20px 25px;
+  margin: 30px 0 40px 0;
+  border-radius: 0 4px 4px 0;
+}
+
+.executive-summary p {
+  margin: 0;
+  font-size: 1em;
+  line-height: 1.8;
+  color: #2a2a2a;
+}
+
+.executive-summary .summary-label {
+  font-weight: 600;
+  font-size: 0.75em;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #009A44;
+  margin-bottom: 8px;
+}
+
+.visual-description {
+  background-color: #fafafa;
+  border: 1px solid #e8e8e8;
+  border-top: 3px solid #009A44;
+  padding: 18px 22px;
+  margin-top: 16px;
+  margin-bottom: 40px;
+  border-radius: 0 0 4px 4px;
+  font-size: 0.93em;
+  color: #333;
+  line-height: 1.75;
+}
+
+.visual-label {
+  font-size: 0.72em;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #009A44;
+  margin-bottom: 4px;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid #e0e0e0;
+  margin: 40px 0;
+}
+
+#TOC {
+  font-family: 'Inter', sans-serif;
+  font-size: 0.88em;
+  border: 1px solid #e8e8e8;
+  border-radius: 4px;
+  padding: 12px 16px;
+  background-color: #fafafa;
+}
+
+#TOC a {
+  color: #333;
+  text-decoration: none;
+}
+
+#TOC a:hover {
+  color: #009A44;
+}
+
+.methodology-note {
+  font-size: 0.82em;
+  color: #666;
+  border-top: 1px solid #e0e0e0;
+  padding-top: 12px;
+  margin-top: 50px;
+}
+```
+```
+
+## Summary
+
+<div class="executive-summary">
+<div class="summary-label">What's the deal with housing affordability in Ireland and Texas?</div>
+<p>
+On the surface, it may be difficult to see many similarities between the country 
+of Ireland and Texas--one of the largest states in the US. However, looking deeper,
+both regions are facing a severe housing affordability crisis. Ireland has continued 
+to suffer from an undersupply of homes after the 2008 finacial crisis, which has 
+only compounded with increasing population growth and high immigration. Texas is 
+also seeing high population growth as of late, with population growth outpacing 
+construction. This has caused median rent prices to rise substantially since 2019. 
+
+
+This brief highlights comparisons across rental burden, rent growth trajectories,
+construction output, and the relationship between population density and rent across
+Irish counties and Texas counties. 
+</p>
+</div>
+
+## Rent Burden Across Ireland
+
+<div class="visual-label">Figure 1</div>
+
+```{r}
+
+# Visual 1: Geospatial: Rent Burden by County (Ireland)
+      #What it shows: A choropleth map of Ireland where each county is shaded by the percentage of median income        consumed by median rent.
+      #Why it's included: This is your anchor Ireland visual. It immediately shows the geographic inequality of        the crisis — Dublin and surrounding commuter belt counties will stand out dramatically against more rural        western counties. It gives a general audience an instant spatial intuition for where the crisis is worst,        and sets up the comparison with Texas   
+      
+      # --- STEP 1: CLEAN INCOME DATA ---
+      
+      # Define the 26 Irish counties to filter out regional aggregates
+      irish_counties <- c("Carlow", "Cavan", "Clare", "Cork", "Donegal", "Dublin",
+                          "Galway", "Kerry", "Kildare", "Kilkenny", "Laois", "Leitrim",
+                          "Limerick", "Longford", "Louth", "Mayo", "Meath", "Monaghan",
+                          "Offaly", "Roscommon", "Sligo", "Tipperary", "Waterford",
+                          "Westmeath", "Wexford", "Wicklow")
+      
+      income_2019 <- irelandcountyincome %>%
+        filter(
+          Statistic.Label == "Disposable Income per Person",
+          Year == 2019,
+          County.and.Region %in% irish_counties
+        ) %>%
+        select(county = County.and.Region, income_per_person = VALUE)
+      
+      # --- STEP 2: CLEAN RTB RENT DATA ---
+      
+      irish_counties <- c("Carlow", "Cavan", "Clare", "Cork", "Donegal", "Dublin",
+                          "Galway", "Kerry", "Kildare", "Kilkenny", "Laois", "Leitrim",
+                          "Limerick", "Longford", "Louth", "Mayo", "Meath", "Monaghan",
+                          "Offaly", "Roscommon", "Sligo", "Tipperary", "Waterford",
+                          "Westmeath", "Wexford", "Wicklow")
+      
+      recent_rent_county <- irelandRTBrentindex %>%
+        filter(
+          Property.Type == "All property types",
+          Number.of.Bedrooms == "All bedrooms",
+          !is.na(VALUE),
+          VALUE != "N/A"
+        ) %>%
+        mutate(
+          VALUE = as.numeric(VALUE),
+          year = as.numeric(substr(Quarter, 1, 4)),
+          county = case_when(
+            str_detect(Location, "^Dublin") ~ "Dublin",
+            str_detect(Location, ", Dublin$") ~ "Dublin",
+            Location %in% irish_counties ~ Location,
+            Location == "Carlow Town" ~ "Carlow",
+            Location == "Cavan Town" ~ "Cavan",
+            Location == "Cork City" ~ "Cork",
+            Location == "Donegal Town" ~ "Donegal",
+            Location == "Galway City" ~ "Galway",
+            Location == "Kildare Town" ~ "Kildare",
+            Location == "Kilkenny City" ~ "Kilkenny",
+            Location == "Limerick City" ~ "Limerick",
+            Location == "Longford Town" ~ "Longford",
+            Location == "Louth Town" ~ "Louth",
+            Location == "Monaghan Town" ~ "Monaghan",
+            Location == "Roscommon Town" ~ "Roscommon",
+            Location == "Sligo Town" ~ "Sligo",
+            Location == "Tipperary Town" ~ "Tipperary",
+            Location == "Waterford City" ~ "Waterford",
+            Location == "Wicklow Town" ~ "Wicklow",
+            str_detect(Location, ", ") ~ str_extract(Location, "(?<=, ).*$"),
+            TRUE ~ NA_character_
+          )
+        ) %>%
+        filter(
+          year == max(year, na.rm = TRUE),
+          county %in% irish_counties
+        ) %>%
+        group_by(county) %>%
+        summarise(median_rent = median(VALUE, na.rm = TRUE)) %>%
+        ungroup()
+      
+      # --- STEP 3: CALCULATE RENT BURDEN ---
+      rent_burden <- income_2019 %>%
+        left_join(recent_rent_county, by = "county") %>%
+        mutate(
+          annual_rent = median_rent * 12,
+          rent_burden = (annual_rent / income_per_person) * 100
+        )
+      
+      # --- STEP 4: JOIN TO SHAPEFILE (corrected) ---
+      library(sf)
+      
+      rent_burden_upper <- rent_burden %>%
+        mutate(COUNTY = toupper(county))
+      
+      ie_map_burden <- ie.map %>%
+        left_join(rent_burden_upper, by = "COUNTY")
+      
+      # --- STEP 5: PLOT VISUAL ---
+ggplot(ie_map_burden) +
+        geom_sf(aes(fill = rent_burden), color = "white", linewidth = 0.3) +
+        scale_fill_gradientn(
+          colors = c("#f0faf4", "#99d4b1", "#4db87a", "#009A44", "#006630"),
+          name = "Rent Burden (%)",
+          labels = function(x) paste0(round(x, 0), "%"),
+          na.value = "grey80"
+        ) +
+        labs(
+          title = "Housing Rent Burden by County, Ireland",
+          subtitle = "Annual median rent as % of disposable income per person (2025 rent / 2019 income)",
+          caption = "Sources: Residential Tenancies Board Rent Index | CSO County Incomes and Regional GDP (CIA02)\nNote: Most recent available county-level income data is 2019. Rent reflects most recent RTB quarter."
+        ) +
+        theme_void() +
+        theme(
+          plot.title    = element_text(size = 16, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40"),
+          plot.caption  = element_text(size = 8, hjust = 0.5, color = "grey50"),
+          legend.position = "right",
+          legend.title  = element_text(size = 10, face = "bold"),
+          legend.text   = element_text(size = 9),
+          plot.margin   = margin(20, 20, 20, 20)
+        )
+```
+
+<div class="visual-description">
+This is a choropleth map, where we can see how much of a typical person's take-home pay goes toward rent in each county across Ireland. 
+
+Immediately, we can determine how the geography shapes the crisis. The darker the green, the more financially stretched renters are in that area. Dublin and Kildare are shaded in the darkest green, and are some of Ireland's densest and most economically prosperous counties. However, renters there are spending a far greater share of their disposable income towards housing. Meanwhile, more rural counties in the west and northwest like Donegal and Leitrim are much lighter, reflecting lower rents relative to local incomes. It's clear that Ireland's housing crisis is concentrated in and around the greater Dublin area and is pushing outward into surrounding commuter counties as people are priced out of the capital.
+</div>
+
+## Rent Burden Across Texas
+
+<div class="visual-label">Figure 2</div>
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# Visual 2: — Geospatial: Rent Burden by County (Texas)
+      #What it shows: The exact same metric — rent as a percentage of median income — mapped at the county level       across Texas.
+      #Why it's included: The direct visual mirror of Visual 1. Using the same color scale and metric across both       maps is what makes the comparison honest and immediately readable. A general audience can glance between         the two and draw conclusions without needing to read anything. Texas's geography is also interesting here —       you'll likely see urban cores like Harris County (Houston) and Travis County (Austin) standing out               similarly to how Dublin dominates the Irish map.
+      
+      # --- STEP 1: PULL TEXAS COUNTY GEOMETRY ---
+      options(tigris_use_cache = TRUE)
+      tx_geometry = get_acs(
+        geography = "county",
+        variables = "B01003_001",
+        state = "TX",
+        year = 2023,
+        geometry = TRUE,
+        progress = FALSE
+      ) %>%
+        select(GEOID, geometry)
+      
+      # --- STEP 2: PREPARE RENT BURDEN DATA FOR MOST RECENT YEAR ---
+      tx_burden_2023 <- tx_acs_all %>%
+        filter(year == 2023) %>%
+        select(GEOID, NAME, variable, estimate) %>%
+        pivot_wider(names_from = variable, values_from = estimate) %>%
+        mutate(
+          annual_rent  = median_rent * 12,
+          rent_burden  = (annual_rent / median_income) * 100
+        )
+      
+      # --- STEP 3: JOIN TO GEOMETRY ---
+      tx_map_burden <- tx_geometry %>%
+        left_join(tx_burden_2023, by = "GEOID")
+      
+      # --- STEP 4: PLOT ---
+ggplot(tx_map_burden) +
+        geom_sf(aes(fill = rent_burden), color = "white", linewidth = 0.3) +
+        scale_fill_gradientn(
+          colors = c("#f9e5ea", "#e8899a", "#d4405f", "#BF0D3E", "#6b0722"),
+          name = "Rent Burden (%)",
+          labels = function(x) paste0(round(x, 0), "%"),
+          na.value = "grey80"
+        ) +
+        labs(
+          title = "Housing Rent Burden by County, Texas",
+          subtitle = "Annual median rent as % of median household income (2023)",
+          caption = "Source: US Census Bureau American Community Survey (ACS) 5-Year Estimates 2023\nNote: Counties with insufficient data shown in grey."
+        ) +
+        theme_void() +
+        theme(
+          plot.title    = element_text(size = 16, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40"),
+          plot.caption  = element_text(size = 8, hjust = 0.5, color = "grey50"),
+          legend.position = "right",
+          legend.title  = element_text(size = 10, face = "bold"),
+          legend.text   = element_text(size = 9),
+          plot.margin   = margin(20, 20, 20, 20)
+        )
+```
+
+<div class="visual-description">
+This is another cloropleth map, this time highlighting Texas counties showing rent as a percentage of median household income. **Important Note:** Unfortunately, Ireland does not use median household income as a standard housing metric, and likewise, the United States does not measure disposable income per person (see Figure 1). This is why Irish rent burdens appear higher than Texas rent burdens, partly because individual income is a smaller number than household income. These two cloropleth maps are comparable, but not equivalent to each other.
+
+This map shows how much of a typical household's income goes toward rent in each of Texas's 254 counties. The darker the red, the greater the share of income consumed by rent. Unlike Ireland's map which shows concentration of burden around the Dublin area, Texas is more distributed with rent burden spread across both urban and rural counties, though for very different reasons. In major metros like Harris County (Houston) and Travis County (Austin), high rent driven by population growth and tech industry expansion are the primary culprit. In contrast, many of the deeply shaded rural counties in west and south Texas like Jeff Davis are burdened not because rents are especially high, but because income is quite low. While Ireland and Texas are experiencing housing affordability crises of similar urgency, the geographic results of each crisis is shaped by some different underlying factors.
+</div>
+
+## Rent Growth Over Time (Ireland vs. Texas Major Metros)
+
+<div class="visual-label">Figure 3</div>
+
+```{r}
+
+# Visual 3: Line Chart: Rent Growth Over Time (Ireland vs. Texas Key metros)
+      #What it shows: A multi-line time series showing median rent growth from roughly 2010 to present, comparing       Ireland nationally against a few Texas metros (Houston, Austin, Dallas).
+      #Why it's included: The maps show where the crisis is worst right now, but this visual shows how fast it         got there. Ireland's rent trajectory post-2012 is one of the steepest in the developed world — seeing it on       the same chart as Texas metros gives the audience a sense of scale and velocity. Austin in particular had a       dramatic spike and partial correction that contrasts interestingly with Ireland's more sustained climb.
+      
+      # --- STEP 1: PREPARE IRISH DATA ---
+      
+      # Calculate Ireland national average per quarter
+      ireland_national <- irelandRTBrentindex %>%
+        filter(
+          Property.Type == "All property types",
+          Number.of.Bedrooms == "All bedrooms",
+          !is.na(VALUE),
+          VALUE != "N/A",
+          Location %in% irish_counties
+        ) %>%
+        mutate(
+          VALUE = as.numeric(VALUE),
+          year = as.numeric(substr(Quarter, 1, 4)),
+          quarter_num = as.numeric(substr(Quarter, 6, 6)),
+          date = as.Date(paste0(year, "-", (quarter_num * 3) - 2, "-01"))
+        ) %>%
+        group_by(date) %>%
+        summarise(median_rent = mean(VALUE, na.rm = TRUE)) %>%
+        mutate(location = "Ireland (National Average)")
+      
+      ireland_dublin <- irelandRTBrentindex %>%
+        filter(
+          Property.Type == "All property types",
+          Number.of.Bedrooms == "All bedrooms",
+          Location == "Dublin",
+          !is.na(VALUE),
+          VALUE != "N/A"
+        ) %>%
+        mutate(
+          VALUE = as.numeric(VALUE),
+          year = as.numeric(substr(Quarter, 1, 4)),
+          quarter_num = as.numeric(substr(Quarter, 6, 6)),
+          date = as.Date(paste0(year, "-", (quarter_num * 3) - 2, "-01"))
+        ) %>%
+        select(date, median_rent = VALUE) %>%
+        mutate(location = "Dublin")
+
+      # Combine Irish data and trim to 2023
+      ireland_plot <- bind_rows(ireland_national, ireland_dublin) %>%
+        filter(date <= as.Date("2023-10-01"))
+      
+      # --- STEP 2: PREPARE TEXAS DATA ---
+      tx_metros <- tx_acs_all %>%
+        filter(
+          variable == "median_rent",
+          grepl("Harris|Travis|Dallas", NAME),
+          !grepl("Harrison", NAME)  # exclude Harrison County
+        ) %>%
+        mutate(
+          location = case_when(
+            grepl("Harris", NAME)  ~ "Houston (Harris County)",
+            grepl("Travis", NAME)  ~ "Austin (Travis County)",
+            grepl("Dallas", NAME)  ~ "Dallas County"
+          ),
+          date = as.Date(paste0(year, "-01-01"))
+        ) %>%
+        select(date, median_rent = estimate, location)
+      
+      # --- STEP 3: COMBINE INTO ONE DATAFRAME ---
+      plot_data <- bind_rows(ireland_plot, tx_metros)
+      
+      # --- STEP 4: PLOT ---
+location_colors <- c(
+        "Dublin"                   = "#009A44",
+        "Ireland (National Average)" = "#99d4b1",
+        "Houston (Harris County)"  = "#BF0D3E",
+        "Austin (Travis County)"   = "#e8899a",
+        "Dallas County"            = "#6b0722"
+      )
+      
+      location_types <- c(
+        "Dublin"                     = "solid",
+        "Ireland (National Average)" = "dashed",
+        "Houston (Harris County)"    = "solid",
+        "Austin (Travis County)"     = "solid",
+        "Dallas County"              = "solid"
+      )
+      
+      ggplot(plot_data, aes(x = date, y = median_rent, 
+                            color = location, linetype = location)) +
+        geom_line(linewidth = 1.1) +
+        scale_color_manual(values = location_colors, name = NULL) +
+        scale_linetype_manual(values = location_types, name = NULL) +
+        scale_y_continuous(
+          labels = function(x) paste0("$", scales::comma(x)),
+          limits = c(0, NA)
+        ) +
+        scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+        annotate("rect", xmin = as.Date("2020-01-01"), xmax = as.Date("2021-01-01"),
+                 ymin = 0, ymax = Inf, alpha = 0.1, fill = "grey50") +
+        annotate("text", x = as.Date("2020-06-01"), y = 200,
+                 label = "COVID-19", size = 3, color = "grey50") +
+        labs(
+          title = "Rent Growth Over Time: Ireland vs. Texas major metros",
+          subtitle = "Median monthly rent 2012–2023, in local currency (EUR for Ireland, USD for Texas)",
+          caption = "Sources: Residential Tenancies Board Rent Index | US Census Bureau ACS 5-Year Estimates\nNote: Irish rents in EUR, Texas rents in USD. Currency difference should be considered when comparing levels.",
+          x = NULL,
+          y = "Median Monthly Rent"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title    = element_text(size = 16, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40"),
+          plot.caption  = element_text(size = 8, hjust = 0.5, color = "grey50"),
+          legend.position = "bottom",
+          legend.text   = element_text(size = 9),
+          panel.grid.minor = element_blank(),
+          plot.margin   = margin(20, 20, 20, 20)
+        )
+
+```
+
+<div class="visual-description">
+This is a line chart that tracks how median monthly rent has changed over time from 2012 to 2023, comparing Dublin and Ireland's national average against three of Texas's major metro counties (Houston, Austin, and Dallas). This chart serves to compare trajectory and rate of rent growth in each region. **Important Note:** Irish rents are displayed in euros, Texas rents are displayed in dollars, and the two aren't converted to a common currency. The reason is because the euro and dollar have fluctuated against each other significantly over this period. A fixed rate would misrepresent the purchasing power of renters at any given time.
+
+Dublin's rent growth shows rising steadily and almost without interruption from 2012 onward, briefly flattening during the COVID-19 pandemic before resuming its climb. Ireland's national average shows a similar trend but at a lower level, suggesting the crisis radiates outward from Dublin but is felt across the entire country. On the Texas side, Austin, Houston, and Dallas show a slightly less steep, but still a similar and moderate rate of growth. A major takeaway here is that while Texas metros have shown some capacity to slow increasing rent prices through new construction, Ireland's rent trajectory has remained stubbornly upward. The rippling effects of these raising rent prices may have been caused by a lack of proper housing over a decade ago (see Figure 4).
+</div>
+
+## New Housing Completions vs. Population Growth
+
+<div class="visual-label">Figure 4</div>
+
+```{r}
+
+#Visual 4: Bar Chart: Housing Completions vs. Population Growth
+      #What it shows: A grouped or side-by-side bar chart comparing annual housing completions against population       growth for Ireland and Texas over the same period.
+      #Why it's included: This is your supply-side argument visual. Both Ireland and Texas have booming                populations, but their construction responses have differed significantly. Texas — especially Houston with       its loose zoning — has generally built more aggressively. Ireland's completions have chronically lagged          demand. This visual makes the policy argument that the crisis is fundamentally a supply problem, and that        zoning and planning policy has a measurable effect on outcomes.
+      
+      # --- STEP 1: IRELAND DATA ---
+      ireland_plot2 <- ireland_completions %>%
+        left_join(ireland_pop_annual, by = "year") %>%
+        arrange(year) %>%
+        mutate(
+          completions_rate = (completions / population) * 1000,
+          country = "Ireland"
+        )
+      
+      # --- STEP 2: TEXAS DATA ---
+      tx_plot2 <- tx_completions_annual %>%
+        filter(year >= 2012, year <= 2023) %>%
+        left_join(tx_units, by = "year") %>%
+        arrange(year) %>%
+        mutate(
+          completions_rate = (total_units - lag(total_units)) / lag(population) * 1000,
+          country = "Texas"
+        )
+      
+      # --- STEP 3: COMBINE ---
+      plot_data2 <- bind_rows(
+        ireland_plot2 %>% select(year, completions_rate, country),
+        tx_plot2 %>% select(year, completions_rate, country)
+      ) %>%
+        filter(!is.na(completions_rate))
+      
+      # --- STEP 4: CALCULATE REFERENCE LINE ---
+      # Reference line = approximate completions per 1,000 people
+      # needed to keep pace with household formation
+      # Standard planning benchmark is 3.5 per 1,000
+      reference_line <- 3.5
+      
+      # --- STEP 5: PLOT ---
+ggplot(plot_data2, aes(x = factor(year), y = completions_rate, fill = country)) +
+        geom_bar(stat = "identity", width = 0.7) +
+        geom_hline(yintercept = reference_line, linetype = "dashed", 
+                   color = "black", linewidth = 0.5) +
+        annotate("text", x = 1, y = reference_line + 0.15,
+                 label = "",
+                 hjust = 0, size = 3, color = "black") +
+        facet_wrap(~ country, ncol = 1) +
+        scale_fill_manual(
+          values = c("Ireland" = "#009A44", "Texas" = "#BF0D3E"),
+          name = NULL
+        ) +
+        scale_x_discrete(guide = guide_axis(angle = 45)) +
+        scale_y_continuous(
+          labels = function(x) paste0(x)
+        ) +
+        labs(
+          title   = "New Housing Completions per 1,000 People",
+          subtitle = "Annual new dwellings completed per 1,000 residents, 2012–2023\nDashed line indicates minimum threshold needed to meet population demand",
+          caption = "Sources: CSO New Dwelling Completions | CSO Census Population | US Census Bureau ACS\nNote: Irish population interpolated between census years 2011, 2016, 2022.\n3.5 units per 1,000 benchmark based on standard housing planning metrics.",
+          x = NULL,
+          y = "Completions per 1,000 People"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title       = element_text(size = 16, face = "bold", hjust = 0.5),
+          plot.subtitle    = element_text(size = 10, hjust = 0.5, color = "grey40"),
+          plot.caption     = element_text(size = 8, hjust = 0.5, color = "grey50"),
+          legend.position  = "none",
+          strip.text       = element_text(size = 12, face = "bold"),
+          panel.grid.minor = element_blank(),
+          plot.margin      = margin(20, 20, 20, 20)
+        )
+
+```
+
+<div class="visual-description">
+This bar chart shows how many new homes were built per 1,000 residents each year from 2012 to 2023, in separate charts for Ireland and Texas. The dashed black line marks 3.5 new completions per 1,000 people, a widely used planning benchmark that represents the minimum construction rate needed to keep pace with natural population growth, new household formation, and the replacement of aging housing stock (The Urban Institute). Anything below that line means a region is falling further behind on housing supply, and anything above means it is building fast enough to meet demand. **Important Note:** There is no available data for Texas in 2012, 2020, and 2021 and Ireland in 2023.
+
+Ireland's panel highlights that for the majority of the decade following the 2008 financial crisis, completions collapsed well below that threshold and only began recovering toward the late 2010s, meaning Ireland spent years accumulating a deepening housing deficit that it has never fully recovered from. Ireland rent prices have risen so relentlessly not because of any single policy failure, but because of a decade of under-building that created a structural shortage of homes that the market is still struggling to meet. Texas, by contrast, shows a trend that is very much inverse. The state has generally stayed closer to or above the threshold from 2013 to 2016, before new housing completions could not meet demand around 2017. This is due to an influx of rapid population growth around this time. Only recently has the state begun to bounce back in terms of construction. 
+</div>
+
+## Population Density vs. Rent
+
+<div class="visual-label">Figure 5</div>
+
+```{r}
+
+#Visual 5: Two Variable Scatter of Rent vs. Population Density
+      
+      # --- STEP 1: IRELAND POPULATION DENSITY ---
+      # Use 2022 census population joined to shapefile area
+      ireland_density <- ie.map %>%
+        st_drop_geometry() %>%
+        select(county = COUNTY, area_m2 = AREA) %>%
+        mutate(
+          county   = str_to_title(county),
+          area_km2 = area_m2 / 1e6
+        ) %>%
+        left_join(
+          irelandpopulationgrowthbycounty %>%
+            filter(CensusYear == 2022, Sex == "Both sexes",
+                   County %in% irish_counties) %>%
+            select(county = County, population = VALUE),
+          by = "county"
+        ) %>%
+        mutate(pop_density = population / area_km2)
+      
+      # --- STEP 2: IRELAND RENT ---
+      ireland_scatter2 <- ireland_density %>%
+        left_join(recent_rent_county, by = "county") %>%
+        mutate(
+          rent_usd = median_rent * 1.08,  # convert EUR to USD
+          country  = "Ireland"
+        ) %>%
+        select(name = county, pop_density, rent_usd, country)
+      
+      # --- STEP 3: TEXAS POPULATION DENSITY ---
+      tx_density <- tx_geometry %>%
+        mutate(area_km2 = as.numeric(st_area(geometry)) / 1e6) %>%
+        st_drop_geometry() %>%
+        left_join(
+          tx_acs_all %>%
+            filter(variable == "total_pop", year == 2023) %>%
+            select(GEOID, population = estimate),
+          by = "GEOID"
+        ) %>%
+        mutate(pop_density = population / area_km2)
+      
+      # --- STEP 4: TEXAS RENT ---
+      texas_scatter2 <- tx_density %>%
+        left_join(
+          tx_burden_2023 %>% select(GEOID, median_rent),
+          by = "GEOID"
+        ) %>%
+        left_join(
+          tx_acs_all %>%
+            filter(variable == "total_pop", year == 2023) %>%
+            select(GEOID, NAME),
+          by = "GEOID"
+        ) %>%
+        mutate(
+          name     = str_remove(NAME, " County, Texas"),
+          rent_usd = median_rent,  # already in USD
+          country  = "Texas"
+        ) %>%
+        filter(!is.na(rent_usd), !is.na(pop_density)) %>%
+        select(name, pop_density, rent_usd, country)
+      
+      # --- STEP 5: COMBINE ---
+      scatter_data2 <- bind_rows(ireland_scatter2, texas_scatter2) %>%
+        filter(!is.na(pop_density), !is.na(rent_usd))
+      
+      # --- STEP 6: IDENTIFY OUTLIERS TO LABEL ---
+      ireland_labels2 <- ireland_scatter2 %>%
+        arrange(desc(rent_usd)) %>%
+        slice(1:5) %>%
+        pull(name)
+      
+      texas_labels2 <- texas_scatter2 %>%
+        arrange(desc(rent_usd)) %>%
+        slice(1:5) %>%
+        pull(name)
+      
+      # Also label highest density counties
+      ireland_density_labels <- ireland_scatter2 %>%
+        arrange(desc(pop_density)) %>%
+        slice(1:2) %>%
+        pull(name)
+      
+      texas_density_labels <- texas_scatter2 %>%
+        arrange(desc(pop_density)) %>%
+        slice(1:2) %>%
+        pull(name)
+      
+      scatter_data2 <- scatter_data2 %>%
+        mutate(
+          label = case_when(
+            name %in% c(ireland_labels2, texas_labels2,
+                        ireland_density_labels, texas_density_labels) ~ name,
+            TRUE ~ NA_character_
+          )
+        )
+      
+      # --- STEP 7: PLOT ---
+ggplot(scatter_data2, aes(x = pop_density, y = rent_usd, color = country)) +
+        geom_point(size = 3, alpha = 0.7) +
+        geom_smooth(method = "lm", se = TRUE, linewidth = 0.8,
+                    linetype = "dashed", alpha = 0.15) +
+        geom_text_repel(
+          aes(label = label),
+          size         = 3,
+          max.overlaps = 20,
+          box.padding  = 0.5,
+          show.legend  = FALSE,
+          na.rm        = TRUE
+        ) +
+        scale_color_manual(
+          values = c("Ireland" = "#009A44", "Texas" = "#BF0D3E"),
+          name   = NULL
+        ) +
+        scale_x_continuous(
+          labels = scales::comma,
+          name   = "Population Density (people per km²)",
+          trans  = "log10"  # log scale handles Texas's wide range better
+        ) +
+        scale_y_continuous(
+          labels = function(x) paste0("$", scales::comma(x)),
+          name   = "Median Monthly Rent (USD)"
+        ) +
+        labs(
+          title    = "Population Density vs. Rent: Irish Counties and Texas Counties",
+          subtitle = "Each dot represents one county. Trend lines show relationship between density and rent for each country.\nIrish rents converted from EUR to USD at 1.08 exchange rate (2025).",
+          caption  = "Sources: RTB Rent Index | CSO Census 2022 | OSi County Boundaries | US Census Bureau ACS 2023\nNote: X axis on log scale to accommodate Texas's wide range of population densities."
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title       = element_text(size = 16, face = "bold", hjust = 0.5),
+          plot.subtitle    = element_text(size = 9, hjust = 0.5, color = "grey40"),
+          plot.caption     = element_text(size = 8, hjust = 0.5, color = "grey50"),
+          legend.position  = "bottom",
+          legend.text      = element_text(size = 10),
+          panel.grid.minor = element_blank(),
+          plot.margin      = margin(20, 20, 20, 20)
+        )
+
+```
+
+<div class="visual-description">
+This is a scatterplot that places every Irish county and every Texas county on the same chart, with population density on the horizontal axis and median monthly rent on the vertical axis. Each green dot is an Irish county and each red dot is a Texas county, with Irish rents converted to US dollars for a direct comparison. 
+
+The dashed trend lines show that both Ireland and Texas show a positive relationship between density and rent, meaning that as more people are packed into a given area, rents tend to rise. An striking observation is that Irish counties sit consistently higher on the rent axis than Texas counties at equivalent or even lower population densities. Limerick, Louth, and Wicklow are moderately dense Irish counties paying rents that meet or exceed Dallas and Harris County in Texas, places with vastly larger and more economically powerful urban centers. Dublin stands far above the rest as a dramatic outlier, commanding rents above $2,300 per month at a density level that many Texas suburbs match at half the price. The steeper slope of Ireland's green trend line compared to Texas's flatter red line tells us that in Ireland, density creates rent pressure far more aggressively than in Texas, suggesting that Ireland's planning and zoning constraints prevent supply from responding to demand in the way that Texas's more permissive development allows. However, while Texas policy allows for high development speed leading to a lower median rent, negative factors like urban sprawl and inequitable distribution of housing tend to be ignored. 
+</div>
+
+<div class="methodology-note">
+**Methodology Note:** Irish rent data sourced from the Residential Tenancies Board 
+Rent Index (RTB), most recent quarter 2025. Irish income data from CSO County Incomes 
+and Regional GDP table CIA02, most recent available year 2019. Texas rent and income 
+data from US Census Bureau American Community Survey 5-Year Estimates, 2023. Irish 
+rents converted to USD at 1.08 EUR/USD (2025 rate) where applicable. County-level 
+income measures differ between countries — Ireland uses disposable income per person 
+while Texas uses median household income — and direct level comparisons should be 
+interpreted accordingly. Irish population interpolated between census years 2011, 
+2016, and 2022.
+</div>
+
